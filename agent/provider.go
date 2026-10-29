@@ -125,14 +125,37 @@ func (c Config) CompactionWindow() int {
 	return k * 1000
 }
 
-// compactionConfig builds the agent-core compaction config for a context window
-// in tokens. agentcore.NewSession wires the summarizer (same provider) when this
-// is set on Options.Compaction.
+// compactionConfig builds a cost-conscious session compaction config from the
+// model's real context capacity. installEconomyCompaction wires the summarizer.
 func compactionConfig(windowTokens int) *compaction.Config {
 	if windowTokens <= 0 {
 		windowTokens = defaultWindowK * 1000
 	}
-	return &compaction.Config{ContextWindow: windowTokens}
+	summaryTokens := 4_096
+	if windowTokens <= 32_000 {
+		summaryTokens = 2_048
+	}
+	// The context window is a capacity limit, not an economical target. Long
+	// tool-heavy runs become expensive well before they reach a large model's
+	// capacity. Compact the conversation at the smaller of the two limits.
+	if windowTokens > 48_000 {
+		windowTokens = 48_000
+	}
+	return &compaction.Config{ContextWindow: windowTokens, MaxOutputTokens: summaryTokens}
+}
+
+// installEconomyCompaction keeps the SDK's normal compaction algorithm but
+// gives its summarizer an output cap consistent with the economic threshold.
+// Options.MaxTokens is the *normal reply* cap and can be much larger than the
+// summary budget, especially for a 32K local model. An enabled noa context
+// manager takes precedence and is left alone.
+func installEconomyCompaction(opts *agentcore.Options) {
+	if opts.Compactor != nil || opts.Compaction == nil {
+		return
+	}
+	opts.Compactor = compaction.New(*opts.Compaction,
+		compaction.ProviderSummarizer(opts.Provider, opts.Compaction.MaxOutputTokens, opts.NonStreaming))
+	opts.Compaction = nil
 }
 
 // FromEnv resolves the LLM provider config:
