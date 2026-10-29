@@ -146,6 +146,55 @@ ON CONFLICT (exploration_id, src_id, rel, dst_id) DO NOTHING`, s.expID, id, RelC
 	return id, tx.Commit()
 }
 
+// DigestWrite is a prepared replacement digest. ReplaceDigests commits all
+// writes and old-digest retirements together, so a failed compression or DB
+// write never leaves the exploration without its previous coverage.
+type DigestWrite struct {
+	Payload   map[string]any
+	MemberIDs []int64
+}
+
+func (s *ExplorationStore) ReplaceDigests(staleIDs []int64, writes []DigestWrite) error {
+	if len(staleIDs) == 0 && len(writes) == 0 {
+		return nil
+	}
+	tx, err := s.db.Begin()
+	if err != nil {
+		return err
+	}
+	defer tx.Rollback()
+	for _, id := range staleIDs {
+		if _, err := tx.Exec(`DELETE FROM exploration_edges
+			WHERE exploration_id=$1 AND src_id=$2 AND rel=$3`, s.expID, id, RelCovers); err != nil {
+			return err
+		}
+		if _, err := tx.Exec(`UPDATE exploration_nodes SET state=$1 WHERE id=$2 AND exploration_id=$3 AND kind=$4`,
+			StateDigestSuperseded, id, s.expID, KindDigest); err != nil {
+			return err
+		}
+	}
+	for _, write := range writes {
+		raw, err := json.Marshal(write.Payload)
+		if err != nil {
+			return err
+		}
+		var id int64
+		if err := tx.QueryRow(`INSERT INTO exploration_nodes(exploration_id, kind, payload, priority, state, origin)
+			VALUES ($1, $2, $3, 0, $4, 'compactor') RETURNING id`,
+			s.expID, KindDigest, string(raw), StateDigestActive).Scan(&id); err != nil {
+			return err
+		}
+		for _, member := range write.MemberIDs {
+			if _, err := tx.Exec(`INSERT INTO exploration_edges(exploration_id, src_id, rel, dst_id)
+				VALUES ($1,$2,$3,$4) ON CONFLICT (exploration_id, src_id, rel, dst_id) DO NOTHING`,
+				s.expID, id, RelCovers, member); err != nil {
+				return err
+			}
+		}
+	}
+	return tx.Commit()
+}
+
 // CoveredMembers maps member id → covering digest id, for ACTIVE digests only
 // (§6.1 point 1). A node with no entry is not currently folded. Should a member
 // carry covers edges from two digests (a torn major write), the lowest digest id

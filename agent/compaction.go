@@ -25,6 +25,7 @@ import (
 	"strings"
 	"sync"
 	"time"
+	"unicode/utf8"
 
 	"github.com/Autumn-27/artex/db"
 	"github.com/Autumn-27/norma/llm"
@@ -35,6 +36,7 @@ import (
 type Compactor struct {
 	prov     llm.Provider
 	model    string
+	windowFn func() int
 	params   coldParams
 	n, m     int           // minor / major thresholds (§7 N=20, M=8)
 	cooldown time.Duration // min gap between compactions per task (§7 60s)
@@ -47,10 +49,11 @@ type Compactor struct {
 
 // NewCompactor builds a compactor. prov/model are used for the §4 body LLM call
 // (same model the agent runs on, per §4). A nil Compactor is a safe no-op.
-func NewCompactor(prov llm.Provider, model string) *Compactor {
+func NewCompactor(prov llm.Provider, model string, windowFn func() int) *Compactor {
 	return &Compactor{
 		prov:     prov,
 		model:    model,
+		windowFn: windowFn,
 		params:   defaultColdParams(),
 		n:        20,
 		m:        8,
@@ -232,8 +235,6 @@ func (c *Compactor) major(ctx context.Context, ts *db.ExplorationStore) {
 		}
 		toCreate = append(toCreate, b)
 	}
-	// Supersede stale digests FIRST (atomic drop of their covers edges) so a member
-	// is never covered by both an old and a new digest (§5.1 one-member-one-digest).
 	var stale []int64
 	for _, d := range active {
 		sig, _ := digestSigGen(d)
@@ -241,11 +242,40 @@ func (c *Compactor) major(ctx context.Context, ts *db.ExplorationStore) {
 			stale = append(stale, d.ID)
 		}
 	}
-	if err := ts.SupersedeDigests(stale); err != nil {
-		log.Printf("[compaction] supersede exp=%d: %v", ts.ID(), err)
-	}
+	// Prepare every replacement before changing coverage. A failed LLM call must
+	// leave the old digests available for the planner and for the next retry.
+	writes := make([]db.DigestWrite, 0, len(toCreate))
 	for _, b := range toCreate {
-		c.foldBlock(ctx, ts, g, b, nodeByID, cvers, c.generationFor(b, active))
+		body, err := c.compress(ctx, g, b, nodeByID)
+		if err != nil {
+			log.Printf("[compaction] compress exp=%d block=%v: %v", ts.ID(), b.Members, err)
+			return
+		}
+		writes = append(writes, db.DigestWrite{Payload: digestPayload(body, b, nodeByID, c.generationFor(b, active), blockSignature(b, cvers)), MemberIDs: b.Members})
+	}
+	// Source data may change while the LLM is running. Defer the whole major
+	// replacement when that happens; a later run will use the fresh graph.
+	fresh, _, err := loadColdGraph(ts)
+	if err != nil {
+		return
+	}
+	freshVersions, err := ts.ContentVersions()
+	if err != nil {
+		return
+	}
+	freshHot := fresh.hotSet()
+	for _, b := range toCreate {
+		if blockSignature(b, freshVersions) != blockSignature(b, cvers) {
+			return
+		}
+		for _, id := range b.Members {
+			if freshHot[id] {
+				return
+			}
+		}
+	}
+	if err := ts.ReplaceDigests(stale, writes); err != nil {
+		log.Printf("[compaction] replace digests exp=%d: %v", ts.ID(), err)
 	}
 }
 
@@ -512,10 +542,68 @@ func buildCompressionInput(g *coldGraph, b block, nodeByID map[int64]*db.Node) s
 // compress runs the §4 body LLM call on one block. Uses the same model the agent
 // runs on; thinking disabled (a pure summarization step).
 func (c *Compactor) compress(ctx context.Context, g *coldGraph, b block, nodeByID map[int64]*db.Node) (string, error) {
+	input := buildCompressionInput(g, b, nodeByID)
+	budget := c.compressionInputBudget()
+	if len(input) <= budget {
+		return c.completeSummary(ctx, compressionSystemPrompt, input, budget)
+	}
+	parts := splitCompressionInput(input, budget-128)
+	summaries := make([]string, 0, len(parts))
+	for i, part := range parts {
+		body, err := c.completeSummary(ctx, compressionChunkPrompt, fmt.Sprintf("片段 %d/%d:\n%s", i+1, len(parts), part), budget)
+		if err != nil {
+			return "", err
+		}
+		summaries = append(summaries, body)
+	}
+	for len(summaries) > 1 {
+		groups, err := groupCompressionSummaries(summaries, budget-128)
+		if err != nil {
+			return "", err
+		}
+		next := make([]string, 0, len(groups))
+		for _, group := range groups {
+			body, err := c.completeSummary(ctx, compressionMergePrompt, group, budget)
+			if err != nil {
+				return "", err
+			}
+			next = append(next, body)
+		}
+		summaries = next
+	}
+	return summaries[0], nil
+}
+
+// A byte is a conservative upper bound for a tokenizer token. Reserve half
+// the model window for instructions, output and estimation error, and cap one
+// compression call at 64K input bytes so large-window models stay economical.
+func (c *Compactor) compressionInputBudget() int {
+	window := defaultWindowK * 1000
+	if c.windowFn != nil && c.windowFn() > 0 {
+		window = c.windowFn()
+	}
+	budget := window / 2
+	if budget > 64_000 {
+		budget = 64_000
+	}
+	if budget < 4_096 {
+		budget = 4_096
+	}
+	return budget
+}
+
+func (c *Compactor) completeSummary(ctx context.Context, system, input string, budget int) (string, error) {
+	maxTokens := budget / 16
+	if maxTokens < 256 {
+		maxTokens = 256
+	}
+	if maxTokens > 1500 {
+		maxTokens = 1500
+	}
 	req := llm.CompletionRequest{
-		System:    []string{compressionSystemPrompt},
-		Messages:  []llm.Message{llm.UserText(buildCompressionInput(g, b, nodeByID))},
-		MaxTokens: 1500,
+		System:    []string{system},
+		Messages:  []llm.Message{llm.UserText(input)},
+		MaxTokens: maxTokens,
 		Thinking:  "disabled",
 	}
 	msg, _, _, err := c.prov.Complete(ctx, req)
@@ -528,6 +616,53 @@ func (c *Compactor) compress(ctx context.Context, g *coldGraph, b block, nodeByI
 	}
 	return body, nil
 }
+
+func splitCompressionInput(input string, limit int) []string {
+	var parts []string
+	for len(input) > limit {
+		end := limit
+		for end > 0 && !utf8.RuneStart(input[end]) {
+			end--
+		}
+		if newline := strings.LastIndexByte(input[:end], '\n'); newline > end/2 {
+			end = newline + 1
+		}
+		parts = append(parts, input[:end])
+		input = input[end:]
+	}
+	if input != "" {
+		parts = append(parts, input)
+	}
+	return parts
+}
+
+func groupCompressionSummaries(summaries []string, limit int) ([]string, error) {
+	var groups []string
+	var current strings.Builder
+	for i, summary := range summaries {
+		part := fmt.Sprintf("摘要 %d:\n%s\n", i+1, summary)
+		if len(part) > limit {
+			return nil, fmt.Errorf("compression summary exceeds input budget")
+		}
+		if current.Len()+len(part) > limit {
+			groups = append(groups, current.String())
+			current.Reset()
+		}
+		current.WriteString(part)
+	}
+	if current.Len() > 0 {
+		groups = append(groups, current.String())
+	}
+	if len(groups) >= len(summaries) {
+		return nil, fmt.Errorf("compression summaries did not shrink")
+	}
+	return groups, nil
+}
+
+const compressionChunkPrompt = compressionSystemPrompt + `
+这是一个较大关联块的片段。只概括片段中出现的节点和关系，保留来源 ID；不要推断片段外的关系。`
+
+const compressionMergePrompt = `你在合并同一关联块的分段摘要。综合已有结论，保留所有重要的来源节点 ID、证据强度和未解决的冲突。不要引入摘要中没有的事实；只输出最终摘要正文。`
 
 // compressionSystemPrompt is the §4 body prompt.
 const compressionSystemPrompt = `你在压缩一组【彼此关联】的探索节点，产出一段综合结论(body)，供规划者快速掌握"这一片已经探明了什么"。
